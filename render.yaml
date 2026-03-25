@@ -9,6 +9,16 @@ services:
         sync: false
       - key: DATA_FILE
         value: /data/data.json
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: REMINDER_CHAT_ID
+        sync: false
+      - key: REMINDER_TIMES
+        value: "09:00,14:00,19:00"
 
     disk:
       name: bot-data

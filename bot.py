@@ -1,19 +1,39 @@
 import os
 import json
 import logging
-from datetime import datetime, date
+import asyncio
+from datetime import datetime, date, time as dtime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
+try:
+    from notion_client import Client as NotionClient
+    from notion_client.errors import APIResponseError as NotionAPIError
+    NOTION_AVAILABLE = True
+except ImportError:
+    NOTION_AVAILABLE = False
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TOKEN = os.environ.get("BOT_TOKEN", "")
+TOKEN     = os.environ.get("BOT_TOKEN", "")
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
+
+# ── Notion / Reminder Config ──────────────────────────────────────────────────
+NOTION_TOKEN       = os.environ.get("NOTION_TOKEN", "")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+REMINDER_CHAT_ID   = os.environ.get("REMINDER_CHAT_ID", "")
+REMINDER_TIMES_RAW = os.environ.get("REMINDER_TIMES", "09:00,14:00,19:00")
+# All times are in UTC. Example: "09:00,14:00,19:00" → 9am, 2pm, 7pm UTC.
 
 # ── RPG Constants ─────────────────────────────────────────────────────────────
 STATS = {
@@ -169,6 +189,135 @@ def format_profile(user: dict) -> str:
     ]
     return "\n".join(lines)
 
+# ── Notion & Reminder Logic ───────────────────────────────────────────────────
+_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+def fetch_notion_todos() -> list:
+    """Fetch all open todos from Notion. Synchronous — call via asyncio.to_thread."""
+    if not NOTION_AVAILABLE:
+        raise RuntimeError("notion-client not installed")
+    client = NotionClient(auth=NOTION_TOKEN)
+    results = client.databases.query(
+        database_id=NOTION_DATABASE_ID,
+        page_size=50,
+    )
+    todos = []
+    for page in results.get("results", []):
+        props = page.get("properties", {})
+        # Find title property (type == "title")
+        title = ""
+        for prop in props.values():
+            if prop.get("type") == "title":
+                parts = prop.get("title", [])
+                title = "".join(p.get("plain_text", "") for p in parts).strip()
+                break
+        if not title:
+            continue
+        # Find priority (select property named "Priority")
+        priority = None
+        for name, prop in props.items():
+            if name.lower() == "priority" and prop.get("type") == "select":
+                sel = prop.get("select")
+                if sel:
+                    priority = sel.get("name", "").lower()
+                break
+        todos.append({"title": title, "priority": priority})
+
+    # Sort: high → medium → low → no priority
+    todos.sort(key=lambda t: _PRIORITY_ORDER.get(t["priority"] or "", 99))
+    return todos
+
+
+def _format_plain_todo_list(todos: list) -> str:
+    if not todos:
+        return "✅ Keine offenen Todos – alles erledigt!"
+    lines = ["📋 *Deine offenen Todos:*"]
+    for t in todos:
+        p = t.get("priority")
+        label = {"high": " 🔴", "medium": " 🟡", "low": " 🟢"}.get(p, "")
+        lines.append(f"• {t['title']}{label}")
+    return "\n".join(lines)
+
+
+def summarize_todos_with_claude(todos: list) -> str:
+    """Use Claude Haiku to create a motivating reminder. Synchronous."""
+    if not todos:
+        return "✅ Keine offenen Todos – alles erledigt! Gute Arbeit!"
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+        return _format_plain_todo_list(todos)
+
+    todo_text = "\n".join(
+        f"- {t['title']}" + (f" [Priorität: {t['priority']}]" if t.get("priority") else "")
+        for t in todos
+    )
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            system=(
+                "Du bist ein fokussierter Produktivitäts-Coach. "
+                "Der Nutzer trackt seine Todos in Notion. "
+                "Schreib eine kurze, motivierende Erinnerung. "
+                "Nur Klartext, keine Markdown-Header. "
+                "Antworte in der Sprache der Aufgaben-Titel."
+            ),
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Hier sind die offenen Todos des Nutzers aus Notion:\n\n{todo_text}\n\n"
+                    "Schreib eine knappe Erinnerung (3-5 Stichpunkte max) die:\n"
+                    "1. Die 2-3 wichtigsten/dringendsten Aufgaben zuerst hervorhebt\n"
+                    "2. Ähnliche Aufgaben gruppiert wenn es viele gibt\n"
+                    "3. Mit einem kurzen motivierenden Satz endet\n"
+                    "Maximal 200 Wörter."
+                ),
+            }],
+        )
+        return response.content[0].text
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return _format_plain_todo_list(todos)
+
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Scheduled job: fetch todos and send reminder to REMINDER_CHAT_ID."""
+    if not REMINDER_CHAT_ID:
+        logger.warning("REMINDER_CHAT_ID not set, skipping reminder")
+        return
+    try:
+        todos = await asyncio.to_thread(fetch_notion_todos)
+    except Exception as e:
+        logger.error(f"Notion fetch failed: {e}")
+        await context.bot.send_message(
+            chat_id=REMINDER_CHAT_ID,
+            text="⚠️ Konnte Todos nicht aus Notion laden. Bitte Token/Datenbank prüfen.",
+        )
+        return
+    message = await asyncio.to_thread(summarize_todos_with_claude, todos)
+    await context.bot.send_message(chat_id=REMINDER_CHAT_ID, text=message, parse_mode="Markdown")
+
+
+def _register_reminder_jobs(app):
+    """Parse REMINDER_TIMES and register daily reminder jobs."""
+    if not REMINDER_CHAT_ID:
+        logger.warning("REMINDER_CHAT_ID not set — tägliche Erinnerungen deaktiviert")
+        return
+    entries = [t.strip() for t in REMINDER_TIMES_RAW.split(",") if t.strip()]
+    registered = 0
+    for time_str in entries:
+        try:
+            hour, minute = map(int, time_str.split(":"))
+            job_time = dtime(hour, minute, tzinfo=timezone.utc)
+            app.job_queue.run_daily(send_reminder, time=job_time, name=f"reminder_{time_str}")
+            logger.info(f"Erinnerung geplant um {time_str} UTC")
+            registered += 1
+        except (ValueError, AttributeError) as e:
+            logger.error(f"Ungültige Zeit in REMINDER_TIMES '{time_str}': {e}")
+    if registered == 0:
+        logger.warning("Keine gültigen Reminder-Zeiten in REMINDER_TIMES gefunden")
+
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
@@ -180,12 +329,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚔️ *Willkommen, {user['name']}!*\n\n"
         "Du bist nun ein *Hunter*. Deine Reise beginnt jetzt.\n\n"
-        "📋 *Commands:*\n"
+        "📋 *RPG Commands:*\n"
         "/log – Aktivität loggen & XP verdienen\n"
         "/stats – Dein Profil & Stats anzeigen\n"
         "/rank – Rang-Übersicht\n"
         "/history – Letzte Aktivitäten\n"
-        "/setname – Name ändern\n",
+        "/setname – Name ändern\n\n"
+        "✅ *Todo-Erinnerungen:*\n"
+        "/todos – Offene Todos aus Notion anzeigen\n"
+        "/reminders – Geplante Erinnerungszeiten anzeigen\n",
         parse_mode="Markdown"
     )
 
@@ -389,6 +541,25 @@ async def setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text(f"✅ Name geändert zu: *{new_name}*", parse_mode="Markdown")
 
+async def todos_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Todos werden geladen...")
+    try:
+        todos = await asyncio.to_thread(fetch_notion_todos)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fehler beim Laden: {e}")
+        return
+    await update.message.reply_text(_format_plain_todo_list(todos), parse_mode="Markdown")
+
+async def reminders_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    entries = [t.strip() for t in REMINDER_TIMES_RAW.split(",") if t.strip()]
+    if not entries or not REMINDER_CHAT_ID:
+        await update.message.reply_text("Keine Erinnerungen konfiguriert.")
+        return
+    lines = ["⏰ *Geplante Erinnerungen (UTC):*"]
+    for t in entries:
+        lines.append(f"  • {t} Uhr")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -413,6 +584,10 @@ def main():
     app.add_handler(CommandHandler("rank", rank_info))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("setname", setname))
+    app.add_handler(CommandHandler("todos", todos_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
+
+    _register_reminder_jobs(app)
 
     logger.info("Bot läuft...")
     app.run_polling()
