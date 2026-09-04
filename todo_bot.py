@@ -198,7 +198,7 @@ def process_with_llm(user_text: str, todos: list) -> dict:
     try:
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-4-maverick-17b-128e-instruct",
             max_tokens=400,
             temperature=0,
             messages=[
