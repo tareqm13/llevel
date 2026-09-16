@@ -192,7 +192,9 @@ def process_with_llm(user_text: str, todos: list) -> dict:
         "- priority low: irgendwann/später/someday/wenn Zeit\n"
         "- priority medium: alles andere\n"
         "- Bereinige Titel: Entferne Füllwörter, halte sie prägnant\n"
-        "- todos und delete_ids sind immer Arrays (auch wenn leer: [])"
+        "- todos und delete_ids sind immer Arrays (auch wenn leer: [])\n"
+        "- WICHTIG: Wenn der Benutzer sagt er hat ALLE Aufgaben erledigt (z.B. 'alle erledigt', 'alles erledigt', 'alle Aufgaben abgehakt', 'alles done', 'alle Aufgaben erledigt'), dann setze intent=delete und füge ALLE page_ids aus der Todo-Liste in delete_ids ein\n"
+        "- WICHTIG: Sätze wie 'alle Aufgaben erledigt' bedeuten IMMER intent=delete mit allen IDs – niemals intent=add"
     )
 
     try:
@@ -257,7 +259,7 @@ def summarize_with_claude(todos: list) -> str:
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=300,
             system=(
                 "Du bist ein fokussierter Produktivitäts-Coach. "
@@ -296,6 +298,9 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             text="⚠️ Konnte Todos nicht aus Notion laden.",
         )
+        return
+    if not todos:
+        logger.info("send_reminder: keine Todos, keine Nachricht gesendet")
         return
     message = await asyncio.to_thread(summarize_with_claude, todos)
     await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
@@ -479,7 +484,7 @@ async def handle_voice_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
         )
         return ConversationHandler.END
 
-    msg = await update.message.reply_text("🎙 Transkribiere Sprachnachricht...", reply_markup=MAIN_KEYBOARD)
+    msg = await update.message.reply_text("🎙 Transkribiere Sprachnachricht...")
 
     voice = update.message.voice
     tg_file = await ctx.bot.get_file(voice.file_id)
